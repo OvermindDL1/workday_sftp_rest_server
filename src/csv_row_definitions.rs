@@ -32,13 +32,14 @@ pub struct INT005ARow {
     pub EmployeeID: String,
     pub FirstName: String,
     pub LastName: String,
+    pub EarningType: String,
     pub Amount: f64, // Yes this it what it is in banner...
-    #[serde(deserialize_with = "date_time_weird_dash")]
-    pub PeriodStartDate: NaiveDateTime,
-    #[serde(deserialize_with = "date_time_weird_dash")]
-    pub PeriodEndDate: NaiveDateTime,
-    #[serde(deserialize_with = "date_time_weird_dash")]
-    pub PaymentDate: NaiveDateTime,
+    //#[serde(deserialize_with = "date_time_weird_dash")]
+    pub PeriodStartDate: NaiveDate,
+    //#[serde(deserialize_with = "date_time_weird_dash")]
+    pub PeriodEndDate: NaiveDate,
+    //#[serde(deserialize_with = "date_time_weird_dash")]
+    pub PaymentDate: NaiveDate,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
