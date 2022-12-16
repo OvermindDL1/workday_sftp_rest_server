@@ -1,138 +1,324 @@
 #![allow(non_snake_case)]
 
-use anyhow::Context as _;
-use axum::{
-    Json,
-    routing::get,
-    Router,
-};
-use glob::glob;
-use serde::{Deserialize, Serialize};
+use axum::extract::Host;
+use axum::handler::Handler;
+use axum::http::{StatusCode, Uri};
+use axum::response::Redirect;
+use axum::{routing::get, Extension, Json, Router};
+use axum_auth::AuthBearer;
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
+use chrono::NaiveDate;
+use clap::Parser;
+use r2d2_oracle::r2d2::Pool;
+use r2d2_oracle::{r2d2, OracleConnectionManager};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+use tracing::*;
+use workday_sftp_rest_server::args::Args;
+use workday_sftp_rest_server::configuration::BACKUP_KEEP;
+use workday_sftp_rest_server::csv_row_definitions::*;
+use workday_sftp_rest_server::logging::setup_logger;
+use workday_sftp_rest_server::utils::csv::{
+    get_last_matching_file_delete_rest_as_csv, write_csv_with_date_to,
+};
+use workday_sftp_rest_server::utils::{shutdown_signal, AnyResult};
 
-trait ExtendedAnyhow<T> {
-    fn from_anyhow(self) -> Result<T, String>;
-}
-
-impl<T> ExtendedAnyhow<T> for anyhow::Result<T> {
-    fn from_anyhow(self) -> Result<T, String> {
-        match self {
-            Ok(t) => Ok(t),
-            Err(e) => {
-                let error = format!("{e:?}");
-                eprintln!("{}", &error);
-                Err(error)
-            }
-        }
+#[derive(Clone)]
+pub struct Token(&'static [u8]);
+impl Default for Token {
+    fn default() -> Self {
+        Token(&[
+            34, 23, 34, 20, 40, 160, 68, 51, 102, 241, 157, 171, 244, 48, 196, 243, 179, 79, 225,
+            172, 37, 168, 194, 219, 65, 11, 102, 80, 162, 45, 7, 44, 8, 9, 147, 142, 193, 126, 233,
+            184, 17, 65, 120, 49, 136, 90, 217, 196, 19, 111, 162, 103, 240, 185, 60, 1, 82, 6,
+            142, 150, 143, 149, 203, 255,
+        ])
     }
 }
+impl Token {
+    pub fn assert_valid(&self, token: &str) -> anyhow::Result<()> {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha512::new();
+        hasher.update(token.as_bytes());
+        let hash = hasher.finalize();
+        if self.0 != hash.as_slice() {
+            anyhow::bail!("invalid token");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ports {
+    http: u16,
+    https: u16,
+}
+
+type OraclePool = Pool<OracleConnectionManager>;
 
 #[tokio::main]
-async fn main() {
-    // TODO: Add token authorization
-    // TODO: Add oracle connector (>.<)
-    // TODO: Add https support with self-signed certificate
+async fn main() -> anyhow::Result<()> {
     // TODO: Automatic starting via systemd service
     // TODO: (Tokio-based?) internal cron-job functionality
+    let args = Args::parse();
+    setup_logger(&args)?;
+
+    let oracleManager = OracleConnectionManager::new(
+        "argos_all",
+        "2014_arg0z_iz_k3wl",
+        // "ditusr",
+        // "fgz940ty459",
+        "//prodbandb.clovis.edu/PROD.clovis.edu",
+    );
+    let oraclePool: OraclePool = r2d2::Pool::builder().max_size(2).build(oracleManager)?;
+
+    let ports = Ports {
+        http: 4080,
+        https: 4443,
+    };
+
     let app = Router::new()
+        .route("/INT004.json", get(route_INT004))
+        .route("/INT005A.json", get(route_INT005A))
         .route("/INT069A.json", get(route_INT069A))
         .route("/INT069B.json", get(route_INT069B))
-        .route("/", get(|| async { "pong" }));
+        .route("/testering", get(route_testering))
+        .route("/", get(|| async { "pong\n" }))
+        .layer(Extension(Token::default()))
+        .layer(Extension(oraclePool));
 
-    // run it with hyper on 0.0.0.0:3000
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+    let config = RustlsConfig::from_pem_file(
+        PathBuf::from(".")
+            .join("self_signed_certs")
+            .join("cert.pem"),
+        PathBuf::from(".").join("self_signed_certs").join("key.pem"),
+    )
+    .await?;
+
+    let addr_http = SocketAddr::from(([0, 0, 0, 0], ports.http));
+    let addr_https = SocketAddr::from(([0, 0, 0, 0], ports.https));
+    let handle_http = Handle::new();
+    let handle_shutdown_http = handle_http.clone();
+    let handle_https = Handle::new();
+    let handle_shutdown_https = handle_https.clone();
+    // Serve both, because argos can't talk self-signed certs and can't get a real cert without exposing to internet...
+    // tokio::spawn(redirect_http_to_https(ports, handle.clone()));
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("shutdown signal triggerred, performing graceful shutdown");
+        handle_shutdown_http.graceful_shutdown(Some(Duration::from_secs(30)));
+        handle_shutdown_https.graceful_shutdown(Some(Duration::from_secs(30)));
+    });
+    let app_http = app.clone();
+    tokio::spawn(async move {
+        info!("HTTP listening on {}", addr_http);
+        axum_server::bind(addr_http)
+            .handle(handle_http)
+            .serve(app_http.into_make_service())
+            .await
+            .expect("http server error");
+    });
+    info!("HTTPS listening on {}", addr_https);
+    axum_server::bind_rustls(addr_https, config)
+        .handle(handle_https)
         .serve(app.into_make_service())
-        .await
-        .unwrap();
+        .await?;
+
+    Ok(())
 }
 
-const BASE_CSV_PATH: &'static str = "/var/sftp/workday";
-const BACKUP_KEEP: usize = 3;
+#[allow(dead_code)]
+async fn redirect_http_to_https(ports: Ports, handle: Handle) {
+    fn make_https(host: String, uri: Uri, ports: Ports) -> anyhow::Result<Uri> {
+        let mut parts = uri.into_parts();
 
-fn get_last_matching_file_delete_rest(globsb: &str) -> anyhow::Result<PathBuf> {
-    let globs = format!("{BASE_CSV_PATH}/{globsb}");
-    let matches = glob(&globs)?;
-    let mut paths: Vec<PathBuf> = matches.collect::<Result<_, _>>()?;
-    if paths.is_empty() {
-        anyhow::bail!("no matching files for {}", globsb);
-    }
-    paths.sort();
-    if !paths.last().unwrap().is_file() {
-        anyhow::bail!("last matching path is not a file: {:?}", paths.last().unwrap());
-    }
-    if paths.len() > BACKUP_KEEP {
-        eprintln!("Too many files matching `{globsb}`, deleting old:");
-        for to_del in &paths[0..(paths.len()-BACKUP_KEEP)] {
-            eprintln!("\t{to_del:?}");
-            std::fs::remove_file(&to_del)?;
+        parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
+
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some("/".parse()?);
         }
+
+        let https_host = host.replace(&ports.http.to_string(), &ports.https.to_string());
+        parts.authority = Some(https_host.parse()?);
+
+        Ok(Uri::from_parts(parts)?)
     }
-    println!("Found matching paths: {paths:?}");
-    Ok(paths.pop().unwrap())
+
+    let redirect = move |Host(host): Host, uri: Uri| async move {
+        match make_https(host, uri, ports) {
+            Ok(uri) => Ok(Redirect::permanent(&uri.to_string())),
+            Err(error) => {
+                tracing::warn!(%error, "failed to convert URI to HTTPS");
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+    };
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], ports.http));
+    info!("HTTP redirect listening on {}", addr);
+
+    axum_server::bind(addr)
+        .handle(handle)
+        .serve(redirect.into_make_service())
+        .await
+        .expect("HTTP-to-HTTPS server errored");
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct INT069ARow {
-    Employee_ID: String,
-    User_Name: String,
-    dateOfBirth: String,
-    #[serde(rename(deserialize = "Legal_Name_-_First_Name"))] Legal_Name_First_Name: String,
-    #[serde(rename(deserialize = "Legal_Name_-_Middle_Name"))] Legal_Name_Middle_Name: String,
-    #[serde(rename(deserialize = "Legal_Name_-_Last_Name"))] Legal_Name_Last_Name: String,
-    #[serde(rename(deserialize = "Preferred_Name_-_First_Name"))] Preferred_Name_First_Name: String,
-    #[serde(rename(deserialize = "Preferred_Name_-_Middle_Name"))] Preferred_Name_Middle_Name: String,
-    #[serde(rename(deserialize = "Preferred_Name_-_Last_Name"))] Preferred_Name_Last_Name: String,
-    #[serde(rename(deserialize = "Email_-_Work"))] Email_Work: String,
-    #[serde(rename(deserialize = "Email_-_Home"))] Email_Home: String,
-    primaryWorkPhone: String,
-    #[serde(rename(deserialize = "Phone_-_Primary_Home"))] Phone_Primary_Home: String,
-    Primary_Mobile_Phone: String,
-    #[serde(rename(deserialize = "Home_Address_-_Formatted_Line_1"))] Home_Address_Formatted_Line_1: String,
-    #[serde(rename(deserialize = "Home_Address_-_Formatted_Line_2"))] Home_Address_Formatted_Line_2: String,
-    #[serde(rename(deserialize = "Home_Address_-_Formatted_Line_3"))] Home_Address_Formatted_Line_3: String,
-    Home_Address_city: String,
-    Home_Address_State: String,
-    Home_Address_Postal_Code: String,
-    Legacy_Banner_ID: String,
-}
-
-async fn route_INT069A() -> Result<Json<Vec<INT069ARow>>, String> {
-    println!("INT069A request");
-    let file_path = get_last_matching_file_delete_rest("INT069A*.csv").from_anyhow()?;
-    dbg!(&file_path);
-    let mut rdr = csv::Reader::from_path(file_path).context("loading csv file").from_anyhow()?;
-    let data: Vec<INT069ARow> = rdr.deserialize().collect::<Result<_, _>>().context("parsing csv file").from_anyhow()?;
+#[instrument(skip(auth, token, oraclePool))]
+async fn route_INT004(
+    AuthBearer(auth): AuthBearer,
+    Extension(token): Extension<Token>,
+    Extension(oraclePool): Extension<OraclePool>,
+) -> AnyResult<Json<Vec<INT004Row>>> {
+    token.assert_valid(&auth)?;
+    // let from = NaiveDate::from_ymd(2022, 8, 13);
+    // let to = NaiveDate::from_ymd(2022, 8, 26);
+    // let now = NaiveDate::from_ymd(2022, 09, 22);
+    let from = NaiveDate::from_ymd(2000, 01, 01);
+    let to = chrono::Utc::today();
+    let conn = oraclePool.get()?;
+    let rows = conn.query_as_named::<(String, String, String, NaiveDate, f64, NaiveDate, NaiveDate, String)>(
+        r#"
+select SPRIDEN.SPRIDEN_ID "CNum",
+       SPRIDEN.SPRIDEN_LAST_NAME "Last_Name",
+       SPRIDEN.SPRIDEN_FIRST_NAME "First_Name",
+       TO_CHAR(RJRSEAR_ACTIVITY_DATE,'YYYY-MM-DD') "Activity_Date",
+       RJRSEAR.RJRSEAR_AUTH_EARNINGS "Balance_Amount",
+       TO_CHAR(RJRSEAR_AUTH_END_DATE,'YYYY-MM-DD') "Auth_End_Date",
+       TO_CHAR(RJRSEAR_AUTH_START_DATE,'YYYY-MM-DD') "Auth_Start_Date",
+       CASE
+            WHEN RJRSEAR_FUND_CODE LIKE 'NM%' THEN 'STATE_AWD_AMT_MEMO'
+            ELSE 'FWS_AWD_AMT_MEMO'
+       END "Award_Type"
+  from FAISMGR.RJRSEAR RJRSEAR,
+       SATURN.SPRIDEN SPRIDEN
+where ( RJRSEAR.RJRSEAR_PIDM = SPRIDEN.SPRIDEN_PIDM )
+   and ( SPRIDEN.SPRIDEN_CHANGE_IND is null
+         and RJRSEAR.RJRSEAR_AUTH_EARNINGS > 1
+         and RJRSEAR.RJRSEAR_AUTH_END_DATE >=sysdate )
+"#
+        &[
+            //("main_DT_From", &from),
+            //("main_DT_To", &to), // Oracle's `BETWEEN` is inclusive on both sides
+        ],
+    )?;
+    let int069a =
+        get_last_matching_file_delete_rest_as_csv::<INT069ARow>("INT069A*.csv", BACKUP_KEEP)?;
+    let mappingCnumToEID: HashMap<String, String> = int069a
+        .into_iter()
+        .map(|row| (row.Legacy_Banner_ID, row.Employee_ID))
+        .collect();
+    let data: Vec<INT004Row> = rows
+        .map(move |row| -> AnyResult<_> {
+            let (
+                cnum,
+                LAST_NAME,
+                FIRST_NAME,
+                ACTIVITY_DATE,
+                BALANCE_AMOUNT,
+                AUTH_END_DATE,
+                AUTH_START_DATE,
+                AWARD_TYPE,
+            ) = row?;
+            let STUDENT_ID = mappingCnumToEID
+                .get(&cnum)
+                .cloned()
+                .unwrap_or_else(|| format!("EID-NOT-FOUND-FOR-{cnum}"));
+            Ok(INT004Row {
+                STUDENT_ID,
+                LAST_NAME,
+                FIRST_NAME,
+                ACTIVITY_DATE,
+                BALANCE_AMOUNT,
+                AUTH_END_DATE,
+                AUTH_START_DATE,
+                AWARD_TYPE,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    write_csv_with_date_to("INT004/INT004", &data, 0)?;
     Ok(Json(data))
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct INT069BRow {
-    Position_ID: String,
-    #[serde(rename(deserialize = "External Position ID"))] External_Position_ID: String,
-    Employee_ID: String,
-    Time_Type: String,
-    Employee_Type: String,
-    Position_Title: String,
-    Job_Profile_ID: String,
-    Job_Profile_Name: String,
-    Job_Family_Group: String,
-    Position_Start: String,
-    Position_End: String,
-    Division: String,
-    Department: String,
-    Position_Location_Address_Line_1: String,
-    Position_Location_Address_Line_2: String,
-    Position_Location_Address_Line_3: String,
-    Position_Location_Address_City: String,
-    Position_Location_Address_State: String,
-    Position_Location_Address_Postal_Code: String,
+#[instrument(skip(auth, token))]
+async fn route_INT005A(
+    AuthBearer(auth): AuthBearer,
+    Extension(token): Extension<Token>,
+) -> AnyResult<Json<Vec<INT005ARow>>> {
+    token.assert_valid(&auth)?;
+    let data =
+        get_last_matching_file_delete_rest_as_csv("TEST-CCC-WorkStudyAwards-*.csv", BACKUP_KEEP)?;
+    Ok(Json(data))
 }
 
-async fn route_INT069B() -> Result<Json<Vec<INT069BRow>>, String> {
-    println!("INT069B request");
-    let file_path = get_last_matching_file_delete_rest("INT069B*.csv").from_anyhow()?;
-    dbg!(&file_path);
-    let mut rdr = csv::Reader::from_path(file_path).context("loading csv file").from_anyhow()?;
-    let data: Vec<INT069BRow> = rdr.deserialize().collect::<Result<_, _>>().context("parsing csv file").from_anyhow()?;
+#[instrument(skip(auth, token))]
+async fn route_INT069A(
+    AuthBearer(auth): AuthBearer,
+    Extension(token): Extension<Token>,
+) -> AnyResult<Json<Vec<INT069ARow>>> {
+    token.assert_valid(&auth)?;
+    let data = get_last_matching_file_delete_rest_as_csv("INT069A*.csv", BACKUP_KEEP)?;
     Ok(Json(data))
+}
+
+#[instrument(skip(auth, token))]
+async fn route_INT069B(
+    AuthBearer(auth): AuthBearer,
+    Extension(token): Extension<Token>,
+) -> AnyResult<Json<Vec<INT069BRow>>> {
+    token.assert_valid(&auth)?;
+    let data = get_last_matching_file_delete_rest_as_csv("INT069B*.csv", BACKUP_KEEP)?;
+    Ok(Json(data))
+}
+
+#[instrument()]
+async fn route_testering() -> AnyResult<&'static str> {
+    let manager = OracleConnectionManager::new(
+        "argos_all",
+        "2014_arg0z_iz_k3wl",
+        // "ditusr",
+        // "fgz940ty459",
+        "//prodbandb.clovis.edu/PROD.clovis.edu",
+    );
+    let pool = r2d2::Pool::builder().max_size(2).build(manager)?;
+    info_span!("tester").in_scope(|| -> AnyResult<()> {
+        let conn = pool.get()?;
+        let rows = conn.query_as_named::<(String, String, String, NaiveDate, isize, NaiveDate, NaiveDate, String)>(
+            //"SELECT 1 FROM SPRIDEN OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+            // "SELEcT 1 from dual",
+            r#"
+select SPRIDEN.SPRIDEN_ID "Student_ID",
+       SPRIDEN.SPRIDEN_LAST_NAME "Last_Name",
+       SPRIDEN.SPRIDEN_FIRST_NAME "First_Name",
+       TO_CHAR(RJRSEAR_ACTIVITY_DATE,'YYYY-MM-DD') "Activity_Date",
+       RJRSEAR.RJRSEAR_AUTH_EARNINGS "Balance_Amount",
+       TO_CHAR(RJRSEAR_AUTH_END_DATE,'YYYY-MM-DD') "Auth_End_Date",
+       TO_CHAR(RJRSEAR_AUTH_START_DATE,'YYYY-MM-DD') "Auth_Start_Date",
+       CASE
+            WHEN RJRSEAR_FUND_CODE LIKE 'NM%' THEN 'STATE_AWD_AMT_MEMO'
+            ELSE 'FWS_AWD_AMT_MEMO'
+       END "Award_Type"
+  from FAISMGR.RJRSEAR RJRSEAR,
+       SATURN.SPRIDEN SPRIDEN
+where ( RJRSEAR.RJRSEAR_PIDM = SPRIDEN.SPRIDEN_PIDM )
+   and ( SPRIDEN.SPRIDEN_CHANGE_IND is null
+         and RJRSEAR.RJRSEAR_ACTIVITY_DATE BETWEEN :main_DT_From AND :main_DT_To
+         and RJRSEAR.RJRSEAR_AUTH_EARNINGS > 1 )
+order by SPRIDEN.SPRIDEN_LAST_NAME,
+          SPRIDEN.SPRIDEN_FIRST_NAME"#,
+            &[
+                ("main_DT_From", &NaiveDate::from_ymd(2022, 07, 01)),
+                ("main_DT_To", &NaiveDate::from_ymd(2022, 09, 22)),
+            ],
+        )?;
+        for row in rows {
+            let i = row?;
+            dbg!(i);
+        }
+        Ok(())
+    })?;
+    Ok("")
 }
