@@ -180,7 +180,16 @@ async fn route_INT004(
     let from = NaiveDate::from_ymd(2000, 01, 01);
     let to = chrono::Utc::today();
     let conn = oraclePool.get()?;
-    let rows = conn.query_as_named::<(String, String, String, NaiveDate, f64, NaiveDate, NaiveDate, String)>(
+    let rows = conn.query_as_named::<(
+        String,
+        String,
+        String,
+        NaiveDate,
+        f64,
+        NaiveDate,
+        NaiveDate,
+        String,
+    )>(
         r#"
 select SPRIDEN.SPRIDEN_ID "CNum",
        SPRIDEN.SPRIDEN_LAST_NAME "Last_Name",
@@ -199,7 +208,7 @@ where ( RJRSEAR.RJRSEAR_PIDM = SPRIDEN.SPRIDEN_PIDM )
    and ( SPRIDEN.SPRIDEN_CHANGE_IND is null
          and RJRSEAR.RJRSEAR_AUTH_EARNINGS > 1
          and RJRSEAR.RJRSEAR_AUTH_END_DATE >=sysdate )
-"#
+"#,
         &[
             //("main_DT_From", &from),
             //("main_DT_To", &to), // Oracle's `BETWEEN` is inclusive on both sides
