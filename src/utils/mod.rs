@@ -36,7 +36,7 @@ impl Token {
 }
 
 // Make our own error that wraps `anyhow::Error`.
-pub struct AnyError(anyhow::Error);
+pub struct AnyError(pub anyhow::Error);
 pub type AnyResult<T> = Result<T, AnyError>;
 
 impl<E> From<E> for AnyError

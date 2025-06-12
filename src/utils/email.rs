@@ -71,11 +71,11 @@ impl Settings {
 	}
 }
 
-pub async fn mail_layer_middleware<R>(request: Request<R>, next: Next<R>) -> Response {
+pub async fn mail_layer_middleware(request: Request<body::Body>, next: Next) -> Response {
 	let uri = request.uri().path().to_string();
 	let response = next.run(request).await;
 	let (parts, body) = response.into_parts();
-	let data = match hyper::body::to_bytes(body).await {
+	let data = match axum::body::to_bytes(body, usize::MAX).await {
 		Ok(data) => data,
 		Err(err) => {
 			error!("processing mail_layer_middleware, failure to process body: {err:?}");
@@ -86,17 +86,20 @@ pub async fn mail_layer_middleware<R>(request: Request<R>, next: Next<R>) -> Res
 				.into_response();
 		}
 	};
-	let mail_data = data.clone();
-	tokio::spawn(async move {
-		if let Err(err) = send_email(&uri, Ok(mail_data.chunk())).await {
-			error!("sending email: {err:?}")
-		}
-	});
-	Response::from_parts(parts, body::boxed(body::Full::new(data)))
+    if data.len() < 30000 {
+    	let mail_data = data.clone();
+	    tokio::spawn(async move {
+    		if let Err(err) = send_email(&uri, Ok(mail_data.chunk())).await {
+	    		error!("sending email: {err:?}")
+    		}
+	    });
+    }
+	Response::from_parts(parts, body::Body::from(data))
 }
 
 #[instrument(level = "debug", skip(body))]
 pub async fn send_email(uri: &str, body: Result<&[u8], String>) -> anyhow::Result<()> {
+	dbg!(uri);
 	let settings = SETTINGS.get().expect("settings not loaded");
 	let msg = Message::builder().from(settings.email.smtp_from.clone());
 	let msg = if let Some(reply_to) = &settings.email.smtp_reply_to {

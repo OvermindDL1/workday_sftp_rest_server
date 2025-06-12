@@ -101,4 +101,7 @@ pub struct INT069BRow {
 	pub Position_Location_Address_City: String,
 	pub Position_Location_Address_State: String,
 	pub Position_Location_Address_Postal_Code: String,
+	pub Cost_Center_Code: String,
+	pub Cost_Center_Description: String,
+	pub Manager_Employee_ID: String,
 }

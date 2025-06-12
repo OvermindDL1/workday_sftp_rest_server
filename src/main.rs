@@ -1,30 +1,34 @@
 #![allow(non_snake_case)]
+#![recursion_limit = "256"]
 
 use anyhow::Context as _;
-use axum::extract::{Host, Query};
+use axum::extract::{Query};
 use axum::handler::Handler;
+use axum_extra::extract::Host;
+use axum::handler::HandlerWithoutStateExt;
 use axum::http::{StatusCode, Uri};
 use axum::response::Redirect;
-use axum::{routing::get, Extension, Json, Router};
+use axum::{middleware, routing::get, Extension, Json, Router};
 use axum_auth::AuthBearer;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use chrono::NaiveDate;
 use clap::Parser;
-use r2d2_oracle::r2d2::Pool;
-use r2d2_oracle::{r2d2, OracleConnectionManager};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::*;
 use workday_sftp_rest_server::args::Args;
+use workday_sftp_rest_server::banner::BannerConnPool;
 use workday_sftp_rest_server::canvas;
 use workday_sftp_rest_server::configuration::BACKUP_KEEP;
 use workday_sftp_rest_server::csv_row_definitions::*;
 use workday_sftp_rest_server::logging::setup_logger;
 use workday_sftp_rest_server::utils::csv::{get_last_matching_file_delete_rest_as_csv, write_csv_with_date_to};
-use workday_sftp_rest_server::utils::{shutdown_signal, AnyResult, Token};
+use workday_sftp_rest_server::utils::email::mail_layer_middleware;
+use workday_sftp_rest_server::utils::{shutdown_signal, AnyError, AnyResult, Token};
+use workday_sftp_rest_server::{banner, papercut};
 
 const TOKEN_GENERAL: Token = Token::new([
 	34, 23, 34, 20, 40, 160, 68, 51, 102, 241, 157, 171, 244, 48, 196, 243, 179, 79, 225, 172, 37, 168, 194, 219, 65,
@@ -38,8 +42,6 @@ struct Ports {
 	https: u16,
 }
 
-type OraclePool = Pool<OracleConnectionManager>;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	// TODO: Automatic starting via systemd service
@@ -48,14 +50,7 @@ async fn main() -> anyhow::Result<()> {
 	args.init_settings().context("initializing settings")?;
 	setup_logger(&args)?;
 
-	let oracleManager = OracleConnectionManager::new(
-		"argos_all",
-		"2014_arg0z_iz_k3wl",
-		// "ditusr",
-		// "fgz940ty459",
-		"//prodbandb.clovis.edu/PROD.clovis.edu",
-	);
-	let oraclePool: OraclePool = r2d2::Pool::builder().max_size(2).build(oracleManager)?;
+	let banner_pool = banner::BannerConnPool::new()?;
 
 	#[cfg(not(debug_assertions))]
 	let ports = Ports {
@@ -74,9 +69,12 @@ async fn main() -> anyhow::Result<()> {
 		.route("/INT069A.json", get(route_INT069A))
 		.route("/INT069B.json", get(route_INT069B))
 		.route("/is_employee_check.json", get(route_is_employee_check))
+		.route("/employees", get(route_employees))
 		.nest("/canvas", canvas::routes())
+		.nest("/papercut", papercut::routes())
 		.route("/", get(|| async { "pong\n" }))
-		.layer(Extension(oraclePool));
+		.layer(middleware::from_fn(mail_layer_middleware))
+		.layer(Extension(banner_pool));
 
 	let config = RustlsConfig::from_pem_file(
 		PathBuf::from(".").join("self_signed_certs").join("cert.pem"),
@@ -178,10 +176,10 @@ async fn route_is_employee_check(
 	Ok(Json(Err("user not found".to_string())))
 }
 
-#[instrument(skip(auth, oraclePool))]
+#[instrument(skip(auth, banner_pool))]
 async fn route_INT004(
 	AuthBearer(auth): AuthBearer,
-	Extension(oraclePool): Extension<OraclePool>,
+	Extension(banner_pool): Extension<BannerConnPool>,
 ) -> AnyResult<Json<Vec<INT004Row>>> {
 	TOKEN_GENERAL.assert_valid(&auth)?;
 	// let from = NaiveDate::from_ymd(2022, 8, 13);
@@ -189,7 +187,7 @@ async fn route_INT004(
 	// let now = NaiveDate::from_ymd(2022, 09, 22);
 	// let from = NaiveDate::from_ymd(2000, 01, 01);
 	// let to = chrono::Utc::today();
-	let conn = oraclePool.get()?;
+	let conn = banner_pool.get()?;
 	let rows = conn.query_as_named::<(String, String, String, NaiveDate, f64, NaiveDate, NaiveDate, String)>(
 		r#"
 select SPRIDEN.SPRIDEN_ID "CNum",
@@ -221,7 +219,11 @@ where ( RJRSEAR.RJRSEAR_PIDM = SPRIDEN.SPRIDEN_PIDM )
 		.map(|row| (row.Legacy_Banner_ID, row.Employee_ID))
 		.collect();
 	let data: Vec<INT004Row> = rows
-		.map(move |row| -> AnyResult<_> {
+		.filter_map(move |row| -> Option<AnyResult<_>> {
+			let row = match row {
+				Ok(row) => row,
+				Err(e) => return Some(Err(AnyError(e.into()))),
+			};
 			let (
 				cnum,
 				LAST_NAME,
@@ -231,12 +233,12 @@ where ( RJRSEAR.RJRSEAR_PIDM = SPRIDEN.SPRIDEN_PIDM )
 				AUTH_END_DATE,
 				AUTH_START_DATE,
 				AWARD_TYPE,
-			) = row?;
-			let STUDENT_ID = mappingCnumToEID
-				.get(&cnum)
-				.cloned()
-				.unwrap_or_else(|| format!("EID-NOT-FOUND-FOR-{cnum}"));
-			Ok(INT004Row {
+			) = row;
+			let Some(STUDENT_ID) = mappingCnumToEID.get(&cnum).cloned() else {
+				return None;
+			};
+			//	.unwrap_or_else(|| format!("EID-NOT-FOUND-FOR-{cnum}"));
+			Some(Ok(INT004Row {
 				STUDENT_ID,
 				LAST_NAME,
 				FIRST_NAME,
@@ -245,7 +247,7 @@ where ( RJRSEAR.RJRSEAR_PIDM = SPRIDEN.SPRIDEN_PIDM )
 				AUTH_END_DATE,
 				AUTH_START_DATE,
 				AWARD_TYPE,
-			})
+			}))
 		})
 		.collect::<Result<_, _>>()?;
 	write_csv_with_date_to("INT004/INT004", &data, 0)?;
@@ -271,4 +273,159 @@ async fn route_INT069B(AuthBearer(auth): AuthBearer) -> AnyResult<Json<Vec<INT06
 	TOKEN_GENERAL.assert_valid(&auth)?;
 	let data = get_last_matching_file_delete_rest_as_csv("INT069B*.csv", BACKUP_KEEP)?;
 	Ok(Json(data))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Format {
+	format: String,
+}
+
+#[instrument(skip(auth))]
+async fn route_employees(AuthBearer(auth): AuthBearer, Query(format): Query<Format>) -> AnyResult<String> {
+	let format = match format.format.as_str() {
+		"csv" => "csv",
+		unhandled => Err(anyhow::anyhow!("unsupported format: {unhandled}"))?,
+	};
+	TOKEN_GENERAL.assert_valid(&auth)?;
+	let employees = get_last_matching_file_delete_rest_as_csv("INT069A*.csv", BACKUP_KEEP)?;
+	let employees = employees
+		.iter()
+		.map(|e: &INT069ARow| (&e.Employee_ID, e))
+		.collect::<HashMap<_, _>>();
+	let roles = get_last_matching_file_delete_rest_as_csv::<INT069BRow>("INT069B*.csv", BACKUP_KEEP)?;
+	let result = roles
+		.iter()
+		.map(|role| {
+			let employee = employees.get(&role.Employee_ID);
+			(role, employee)
+		})
+		.collect::<Vec<_>>();
+	match format {
+		"csv" => {
+			let mut out = vec![];
+			let mut w = csv::Writer::from_writer(&mut out);
+			#[derive(Default, serde::Serialize)]
+			struct EmployeeRec<'a> {
+				Employee_ID: &'a str,
+				User_Name: &'a str,
+				dateOfBirth: &'a str,
+				Legal_Name_First_Name: &'a str,
+				Legal_Name_Middle_Name: &'a str,
+				Legal_Name_Last_Name: &'a str,
+				Preferred_Name_First_Name: &'a str,
+				Preferred_Name_Middle_Name: &'a str,
+				Preferred_Name_Last_Name: &'a str,
+				Email_Work: &'a str,
+				Email_Home: &'a str,
+				primaryWorkPhone: &'a str,
+				Phone_Primary_Home: &'a str,
+				Primary_Mobile_Phone: &'a str,
+				Home_Address_Formatted_Line_1: &'a str,
+				Home_Address_Formatted_Line_2: &'a str,
+				Home_Address_Formatted_Line_3: &'a str,
+				Home_Address_city: &'a str,
+				Home_Address_State: &'a str,
+				Home_Address_Postal_Code: &'a str,
+				Legacy_Banner_ID: &'a str,
+				Position_ID: &'a str,
+				External_Position_ID: &'a str,
+				Time_Type: &'a str,
+				Employee_Type: &'a str,
+				Position_Title: &'a str,
+				Job_Profile_ID: &'a str,
+				Job_Profile_Name: &'a str,
+				Job_Family_Group: &'a str,
+				Position_Start: &'a str,
+				Position_End: &'a str,
+				Division: &'a str,
+				Department: &'a str,
+				Position_Location_Address_Line_1: &'a str,
+				Position_Location_Address_Line_2: &'a str,
+				Position_Location_Address_Line_3: &'a str,
+				Position_Location_Address_City: &'a str,
+				Position_Location_Address_State: &'a str,
+				Position_Location_Address_Postal_Code: &'a str,
+				Cost_Center_Code: &'a str,
+				Cost_Center_Description: &'a str,
+				Manager_Employee_ID: &'a str,
+			}
+			for (r, me) in result {
+				if let Some(e) = me {
+					w.serialize(EmployeeRec {
+						User_Name: &e.User_Name,
+						dateOfBirth: &e.dateOfBirth,
+						Legal_Name_First_Name: &e.Legal_Name_First_Name,
+						Legal_Name_Middle_Name: &e.Legal_Name_Middle_Name,
+						Legal_Name_Last_Name: &e.Legal_Name_Last_Name,
+						Preferred_Name_First_Name: &e.Preferred_Name_First_Name,
+						Preferred_Name_Middle_Name: &e.Preferred_Name_Middle_Name,
+						Preferred_Name_Last_Name: &e.Preferred_Name_Last_Name,
+						Email_Work: &e.Email_Work,
+						Email_Home: &e.Email_Home,
+						primaryWorkPhone: &e.primaryWorkPhone,
+						Phone_Primary_Home: &e.Phone_Primary_Home,
+						Primary_Mobile_Phone: &e.Primary_Mobile_Phone,
+						Home_Address_Formatted_Line_1: &e.Home_Address_Formatted_Line_1,
+						Home_Address_Formatted_Line_2: &e.Home_Address_Formatted_Line_2,
+						Home_Address_Formatted_Line_3: &e.Home_Address_Formatted_Line_3,
+						Home_Address_city: &e.Home_Address_city,
+						Home_Address_State: &e.Home_Address_State,
+						Home_Address_Postal_Code: &e.Home_Address_Postal_Code,
+						Legacy_Banner_ID: &e.Legacy_Banner_ID,
+						Position_ID: &r.Position_ID,
+						External_Position_ID: &r.External_Position_ID,
+						Employee_ID: &r.Employee_ID,
+						Time_Type: &r.Time_Type,
+						Employee_Type: &r.Employee_Type,
+						Position_Title: &r.Position_Title,
+						Job_Profile_ID: &r.Job_Profile_ID,
+						Job_Profile_Name: &r.Job_Profile_Name,
+						Job_Family_Group: &r.Job_Family_Group,
+						Position_Start: &r.Position_Start,
+						Position_End: &r.Position_End,
+						Division: &r.Division,
+						Department: &r.Department,
+						Position_Location_Address_Line_1: &r.Position_Location_Address_Line_1,
+						Position_Location_Address_Line_2: &r.Position_Location_Address_Line_2,
+						Position_Location_Address_Line_3: &r.Position_Location_Address_Line_3,
+						Position_Location_Address_City: &r.Position_Location_Address_City,
+						Position_Location_Address_State: &r.Position_Location_Address_State,
+						Position_Location_Address_Postal_Code: &r.Position_Location_Address_Postal_Code,
+						Cost_Center_Code: &r.Cost_Center_Code,
+						Cost_Center_Description: &r.Cost_Center_Description,
+						Manager_Employee_ID: &r.Manager_Employee_ID,
+					})?;
+				} else {
+					w.serialize(EmployeeRec {
+						Position_ID: &r.Position_ID,
+						External_Position_ID: &r.External_Position_ID,
+						Employee_ID: &r.Employee_ID,
+						Time_Type: &r.Time_Type,
+						Employee_Type: &r.Employee_Type,
+						Position_Title: &r.Position_Title,
+						Job_Profile_ID: &r.Job_Profile_ID,
+						Job_Profile_Name: &r.Job_Profile_Name,
+						Job_Family_Group: &r.Job_Family_Group,
+						Position_Start: &r.Position_Start,
+						Position_End: &r.Position_End,
+						Division: &r.Division,
+						Department: &r.Department,
+						Position_Location_Address_Line_1: &r.Position_Location_Address_Line_1,
+						Position_Location_Address_Line_2: &r.Position_Location_Address_Line_2,
+						Position_Location_Address_Line_3: &r.Position_Location_Address_Line_3,
+						Position_Location_Address_City: &r.Position_Location_Address_City,
+						Position_Location_Address_State: &r.Position_Location_Address_State,
+						Position_Location_Address_Postal_Code: &r.Position_Location_Address_Postal_Code,
+						Cost_Center_Code: &r.Cost_Center_Code,
+						Cost_Center_Description: &r.Cost_Center_Description,
+						Manager_Employee_ID: &r.Manager_Employee_ID,
+						..Default::default()
+					})?;
+				}
+			}
+			drop(w);
+			Ok(String::from_utf8(out)?)
+		}
+		_ => panic!("impossible"),
+	}
 }

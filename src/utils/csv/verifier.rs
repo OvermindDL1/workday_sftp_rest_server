@@ -3,34 +3,41 @@ use serde::ser::{
 	SerializeTupleVariant,
 };
 use serde::{Serialize, Serializer};
+use std::borrow::Cow;
 use std::fmt::Display;
 
 #[derive(Debug)]
 pub struct Verifier {
+	started: bool,
 	verify: bool,
-	fields: Vec<&'static str>,
-	skipped_fields: Vec<&'static str>,
-	fields_so_far: Vec<&'static str>,
-	skipped_fields_so_far: Vec<&'static str>,
+	fields: Vec<Cow<'static, str>>,
+	skipped_fields: Vec<Cow<'static, str>>,
+	fields_so_far: Vec<Cow<'static, str>>,
+	skipped_fields_so_far: Vec<Cow<'static, str>>,
+	single_parse: String,
 }
 
 impl Verifier {
 	pub fn new() -> Verifier {
 		Verifier {
+			started: false,
 			verify: false,
 			fields: Vec::new(),
 			skipped_fields: Vec::new(),
 			fields_so_far: Vec::new(),
 			skipped_fields_so_far: Vec::new(),
+			single_parse: String::new(),
 		}
 	}
 
 	pub fn reset_to_verify(&mut self) -> anyhow::Result<()> {
+		self.started = false;
 		if !self.verify {
 			if self.fields_so_far.is_empty() {
 				anyhow::bail!("no fields to verify");
 			}
 			self.verify = true;
+
 			std::mem::swap(&mut self.fields, &mut self.fields_so_far);
 			self.fields_so_far.reserve(self.fields.len());
 			std::mem::swap(&mut self.skipped_fields, &mut self.skipped_fields_so_far);
@@ -46,6 +53,8 @@ impl Verifier {
 				self.skipped_fields_so_far
 			);
 		}
+		self.fields_so_far.clear();
+		self.skipped_fields_so_far.clear();
 		Ok(())
 	}
 }
@@ -128,37 +137,6 @@ impl SerializeTupleVariant for Verifier {
 	}
 }
 
-impl SerializeMap for Verifier {
-	type Ok = Verifier;
-	type Error = VerifierError;
-
-	fn serialize_key<T: ?Sized>(&mut self, _key: &T) -> Result<(), Self::Error>
-	where
-		T: Serialize,
-	{
-		Err(VerifierError(anyhow::anyhow!("maps are not supported")))
-	}
-
-	fn serialize_value<T: ?Sized>(&mut self, _value: &T) -> Result<(), Self::Error>
-	where
-		T: Serialize,
-	{
-		Err(VerifierError(anyhow::anyhow!("maps are not supported")))
-	}
-
-	fn serialize_entry<K: ?Sized, V: ?Sized>(&mut self, _key: &K, _value: &V) -> Result<(), Self::Error>
-	where
-		K: Serialize,
-		V: Serialize,
-	{
-		Err(VerifierError(anyhow::anyhow!("maps are not supported")))
-	}
-
-	fn end(self) -> Result<Self::Ok, Self::Error> {
-		Err(VerifierError(anyhow::anyhow!("maps are not supported")))
-	}
-}
-
 impl SerializeStructVariant for Verifier {
 	type Ok = Verifier;
 	type Error = VerifierError;
@@ -179,6 +157,39 @@ impl SerializeStructVariant for Verifier {
 	}
 }
 
+impl SerializeMap for Verifier {
+	type Ok = Verifier;
+	type Error = VerifierError;
+
+	fn serialize_key<T: ?Sized>(&mut self, key: &T) -> Result<(), Self::Error>
+	where
+		T: Serialize,
+	{
+		let mut v = Verifier::new();
+		v.started = true;
+		let v = key.serialize(v)?;
+		if v.single_parse.is_empty() {
+			return Err(VerifierError(anyhow::anyhow!(
+				"serialized something that was not a key: {:?}",
+				&v.fields_so_far
+			)));
+		}
+		self.fields_so_far.push(Cow::Owned(v.single_parse));
+		Ok(())
+	}
+
+	fn serialize_value<T: ?Sized>(&mut self, _value: &T) -> Result<(), Self::Error>
+	where
+		T: Serialize,
+	{
+		Ok(())
+	}
+
+	fn end(self) -> Result<Self::Ok, Self::Error> {
+		Ok(self)
+	}
+}
+
 impl SerializeStruct for Verifier {
 	type Ok = Verifier;
 	type Error = VerifierError;
@@ -187,12 +198,12 @@ impl SerializeStruct for Verifier {
 	where
 		T: Serialize,
 	{
-		self.fields_so_far.push(key);
+		self.fields_so_far.push(Cow::Borrowed(key));
 		Ok(())
 	}
 
 	fn skip_field(&mut self, key: &'static str) -> Result<(), Self::Error> {
-		self.skipped_fields_so_far.push(key);
+		self.skipped_fields_so_far.push(Cow::Borrowed(key));
 		Ok(())
 	}
 
@@ -260,8 +271,13 @@ impl Serializer for Verifier {
 		Err(VerifierError(anyhow::anyhow!("char are not supported")))
 	}
 
-	fn serialize_str(self, _v: &str) -> Result<Self::Ok, Self::Error> {
-		Err(VerifierError(anyhow::anyhow!("str are not supported")))
+	fn serialize_str(mut self, v: &str) -> Result<Self::Ok, Self::Error> {
+		if self.started {
+			self.single_parse = v.to_string();
+			Ok(self)
+		} else {
+			Err(VerifierError(anyhow::anyhow!("str are not supported")))
+		}
 	}
 
 	fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
@@ -284,7 +300,7 @@ impl Serializer for Verifier {
 	}
 
 	fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-		Err(VerifierError(anyhow::anyhow!("unitstructs are not supported")))
+		Err(VerifierError(anyhow::anyhow!("unit structs are not supported")))
 	}
 
 	fn serialize_unit_variant(
@@ -342,12 +358,18 @@ impl Serializer for Verifier {
 		Err(VerifierError(anyhow::anyhow!("tuple variants are not supported")))
 	}
 
-	fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-		Err(VerifierError(anyhow::anyhow!("maps are not supported")))
+	fn serialize_map(mut self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+		if !self.started {
+			self.started = true;
+			Ok(self)
+		} else {
+			Err(VerifierError(anyhow::anyhow!("embedded maps are not supported")))
+		}
 	}
 
-	fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct, Self::Error> {
-		if self.fields_so_far.is_empty() {
+	fn serialize_struct(mut self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct, Self::Error> {
+		if !self.started {
+			self.started = true;
 			Ok(self)
 		} else {
 			Err(VerifierError(anyhow::anyhow!("embedded structs are not supported")))
