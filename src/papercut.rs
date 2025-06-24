@@ -1,11 +1,10 @@
 use crate::configuration::BACKUP_KEEP;
 use crate::csv_row_definitions::{INT069ARow, INT069BRow};
 use crate::utils::csv::get_last_matching_file_delete_rest_as_csv;
-use crate::utils::email::mail_layer_middleware;
 use crate::utils::{AnyResult, Token};
 use crate::SETTINGS;
 use axum::routing::post;
-use axum::{middleware, Json, Router};
+use axum::{Json, Router};
 use axum_auth::AuthBearer;
 use csv::Terminator;
 use serde::{Deserialize, Serialize};
@@ -174,7 +173,7 @@ async fn route_feed_workday_users(AuthBearer(auth): AuthBearer) -> AnyResult<Jso
 	ftp.login(&settings.username, &settings.password)?;
 	let written = ftp.put_file(destination, &mut data.as_slice())?;
 	if written != data.len() as u64 {
-		ftp.quit();
+		ftp.quit()?;
 		return Err(anyhow::anyhow!(
 			"failed to write all data to papercut, only wrote {written}, should have written {}",
 			data.len()

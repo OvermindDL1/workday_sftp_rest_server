@@ -86,14 +86,14 @@ pub async fn mail_layer_middleware(request: Request<body::Body>, next: Next) -> 
 				.into_response();
 		}
 	};
-    if data.len() < 30000 {
-    	let mail_data = data.clone();
-	    tokio::spawn(async move {
-    		if let Err(err) = send_email(&uri, Ok(mail_data.chunk())).await {
-	    		error!("sending email: {err:?}")
-    		}
-	    });
-    }
+	if data.len() < 30000 {
+		let mail_data = data.clone();
+		tokio::spawn(async move {
+			if let Err(err) = send_email(&uri, Ok(mail_data.chunk())).await {
+				error!("sending email: {err:?}")
+			}
+		});
+	}
 	Response::from_parts(parts, body::Body::from(data))
 }
 

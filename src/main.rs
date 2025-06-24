@@ -2,14 +2,13 @@
 #![recursion_limit = "256"]
 
 use anyhow::Context as _;
-use axum::extract::{Query};
-use axum::handler::Handler;
-use axum_extra::extract::Host;
+use axum::extract::Query;
 use axum::handler::HandlerWithoutStateExt;
 use axum::http::{StatusCode, Uri};
 use axum::response::Redirect;
 use axum::{middleware, routing::get, Extension, Json, Router};
 use axum_auth::AuthBearer;
+use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use chrono::NaiveDate;

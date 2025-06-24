@@ -1,22 +1,20 @@
-use crate::banner::queries as BannerQueries;
-use axum::body::Bytes;
-use axum::response::Response;
-use axum::body::Body;
-use async_stream::stream;
-use hyper::Uri;
+// use crate::banner::queries as BannerQueries;
 use crate::banner::BannerConnPool;
 use crate::canvas::csv_defs::*;
 use crate::configuration::BACKUP_KEEP;
 use crate::csv_row_definitions::{INT069ARow, INT069BRow};
 use crate::utils::csv::{get_last_matching_file_delete_rest_as_csv, validate_csv};
-use crate::utils::email::mail_layer_middleware;
 use crate::utils::{AnyResult, Token};
 use crate::SETTINGS;
 use anyhow::Context;
+use async_stream::stream;
+use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::Path;
 use axum::extract::Query;
+use axum::response::Response;
 use axum::routing::{get, post};
-use axum::{middleware, Extension, Json, Router};
+use axum::{Extension, Json, Router};
 use axum_auth::AuthBearer;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 use hyper::HeaderMap;
@@ -181,8 +179,11 @@ pub fn routes() -> Router {
 			"/inject_user",
 			post(router_inject_ssotest_user).delete(router_delete_ssotest_user),
 		)
-        .route("/depaginate/{*canvas_url}", get(route_depaginate_get).post(route_depaginate_post))
-        //.nest("/depaginate", Router::new().fallback(get(route_depaginate_get).post(route_depaginate_post)))
+		.route(
+			"/depaginate/{*canvas_url}",
+			get(route_depaginate_get).post(route_depaginate_post),
+		)
+	//.nest("/depaginate", Router::new().fallback(get(route_depaginate_get).post(route_depaginate_post)))
 }
 
 #[derive(Serialize)]
@@ -625,7 +626,7 @@ async fn router_inject_ssotest_user(
 	let first_name = Some("SSO".to_string());
 	let last_name = Some("Test".to_string());
 	let email = params.email;
-	router_delete_ssotest_user(AuthBearer(auth)).await?;
+	let _unused_json_response = router_delete_ssotest_user(AuthBearer(auth)).await?;
 	let user = User {
 		user_id,
 		integration_id: None,
@@ -650,98 +651,128 @@ async fn router_inject_ssotest_user(
 }
 
 fn parse_link_next(links: &reqwest::header::HeaderValue) -> Option<String> {
-        let Ok(links) = links.to_str() else {
-                panic!("invalid header string: {links:?}")
-        };
-        for link in links.split(',') {
-                let Some((url, rel)) = link.split_once("; ") else {
-                        eprintln!("Invalid link format semicolon: {link}");
-                        continue;
-                };
-                if rel == "rel=\"next\"" {
-                        let url = url.trim_start_matches('<').trim_end_matches('>');
-                        return Some(url.to_string());
-                }
-        }
-        None
+	let Ok(links) = links.to_str() else {
+		panic!("invalid header string: {links:?}")
+	};
+	for link in links.split(',') {
+		let Some((url, rel)) = link.split_once("; ") else {
+			eprintln!("Invalid link format semicolon: {link}");
+			continue;
+		};
+		if rel == "rel=\"next\"" {
+			let url = url.trim_start_matches('<').trim_end_matches('>');
+			return Some(url.to_string());
+		}
+	}
+	None
 }
 
 #[instrument(level = "info", skip(headers))]
 async fn route_depaginate_get(
 	headers: HeaderMap,
-    Path(canvas_path): Path<String>,
+	Path(canvas_path): Path<String>,
 	Query(mut params): Query<HashMap<String, String>>,
 ) -> AnyResult<Response> {
-    let authorization = headers.get("authorization").context("missing authorization")?.to_str().context("headers should be strings")?.to_string();
-    let body = Body::from_stream(stream! {
-        let only_one_page = params.remove("only_one_page").is_some();
-        let client = reqwest::Client::new();
-        let mut canvas_url = Url::parse(&format!("https://cloviscc.instructure.com/{canvas_path}")).context("invalid canvas url")?;
-        let mut response_handle = Some(tokio::spawn(client.get(canvas_url.clone()).header("authorization", &authorization).query(&params).send()));
-        yield Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Bytes::from_static(b"["));
-        loop {
-            let url = canvas_url.to_string();
-            //let response = client.get(canvas_url.clone()).header("authorization", &authorization).send().await?;
-            let Some(response) = response_handle.take() else {
-                panic!("response should never be empty at start of loop...");
-            };
-            let response = response.await.context("canvas task fetch")?.context("canvas fetch")?;
-            if !response.status().is_success() {
-                tracing::warn!(url, status=?response.status(), "canvas bad status response");
-                yield Err(format!("canvas error code {}", response.status()).into());
-                return;
-            }
-            let next_link = if !only_one_page {
-                response.headers().get("link").and_then(parse_link_next)
-            } else {
-                None
-            };
-            if let Some(next_link) = &next_link {
-                canvas_url = Url::parse(&next_link).context("next_link should always be a URL")?;
-                response_handle = Some(tokio::spawn(client.get(canvas_url.clone()).header("authorization", &authorization).send()));
-            }
-            //let links = response.headers().get("link").map(|s| s.to_str().expect("headers should be strings").to_string());
-            match response.json::<Vec<serde_json::Value>>().await {
-                Ok(body) => {
-                    tracing::info!(url, record_count=body.len(), "processing data stream...");
-                    let mut first = true;
-                    for value in body {
-                        if !first {
-                            yield Ok(Bytes::from_static(b","));
-                        }
-                        first = false;
-                        yield Ok(Bytes::from_owner(serde_json::to_string(&value).expect("should always pass since it came from json").into_bytes()));
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(url, ?error, "canvas bad response");
-                    yield Err(format!("corrupt canvas response: {error:?}").into());
-                }
-            }
-            if next_link.is_none() {
-                yield Ok(Bytes::from_static(b"]"));
-                return;
-            } else {
-                yield Ok(Bytes::from_static(b","));
-            }
-            //if let Some(next_link) = next_link {
-            //    //canvas_url = Url::parse(&next_link).context("next_link should always be a URL")?;
-            //} else {
-            //    // No links, only result, end
-            //    yield Ok(Bytes::from_static(b"]"));
-            //    return;
-            //}
-        }
-    });
-	Ok(Response::builder().header("Content-Type", "application/json").body(body).context("constructing response")?)
+	let authorization = headers
+		.get("authorization")
+		.context("missing authorization")?
+		.to_str()
+		.context("headers should be strings")?
+		.to_string();
+	let body = Body::from_stream(stream! {
+		let only_one_page = params.remove("only_one_page").is_some();
+		let client = reqwest::Client::new();
+		let mut canvas_url = Url::parse(&format!("https://cloviscc.instructure.com/{canvas_path}")).context("invalid canvas url")?;
+        canvas_url.query_pairs_mut().extend_pairs(&params);
+		let mut response_handle = Some(tokio::spawn(client.get(canvas_url.clone()).header("authorization", &authorization).send()));
+		yield Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Bytes::from_static(b"["));
+		loop {
+			let url = canvas_url.to_string();
+			//let response = client.get(canvas_url.clone()).header("authorization", &authorization).send().await?;
+			let Some(response) = response_handle.take() else {
+				panic!("response should never be empty at start of loop...");
+			};
+			let response = response.await.context("canvas task fetch")?.context("canvas fetch")?;
+			if !response.status().is_success() {
+				tracing::warn!(url, status=?response.status(), "canvas bad status response");
+				yield Err(format!("canvas error code {}", response.status()).into());
+				return;
+			}
+			let next_link = if !only_one_page {
+				response.headers().get("link").and_then(parse_link_next)
+			} else {
+				None
+			};
+			if let Some(next_link) = &next_link {
+				canvas_url = Url::parse(&next_link).context("next_link should always be a URL")?;
+				response_handle = Some(tokio::spawn(client.get(canvas_url.clone()).header("authorization", &authorization).send()));
+			}
+			//let links = response.headers().get("link").map(|s| s.to_str().expect("headers should be strings").to_string());
+			let body = match response.text().await {
+				Ok(body) => body,
+				Err(error) => {
+					tracing::warn!(url, ?error, "returned canvas data is not textual");
+					yield Err(format!("returned canvas data is not textual: {error:?}").into());
+					return;
+				}
+			};
+			if let Ok(body) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+				tracing::info!(url, record_count=body.len(), "processing data stream...");
+				let mut first = true;
+				for value in body {
+					if !first {
+						yield Ok(Bytes::from_static(b","));
+					}
+					first = false;
+					yield Ok(Bytes::from_owner(serde_json::to_string(&value).expect("should always pass since it came from json").into_bytes()));
+				}
+			} else if let Ok(body) = serde_json::from_str::<HashMap<String, Vec<serde_json::Value>>>(&body) {
+				if body.len() != 1 {
+					tracing::warn!(url, ?body, "map body with more than one field");
+					yield Err(format!("map body with more than one field: {body:?}").into());
+				}
+				let body = body.into_iter().next().expect("already confirmed 1 value").1;
+				tracing::info!(url, record_count=body.len(), "processing data stream...");
+				let mut first = true;
+				for value in body {
+					if !first {
+						yield Ok(Bytes::from_static(b","));
+					}
+					first = false;
+					yield Ok(Bytes::from_owner(serde_json::to_string(&value).expect("should always pass since it came from json").into_bytes()));
+				}
+			} else {
+				tracing::warn!(url, body, "unhandled canvas response");
+				yield Err(format!("unhandled canvas response: {body}").into());
+				return;
+			}
+			if next_link.is_none() {
+				yield Ok(Bytes::from_static(b"]"));
+				return;
+			} else {
+				yield Ok(Bytes::from_static(b","));
+			}
+			//if let Some(next_link) = next_link {
+			//    //canvas_url = Url::parse(&next_link).context("next_link should always be a URL")?;
+			//} else {
+			//    // No links, only result, end
+			//    yield Ok(Bytes::from_static(b"]"));
+			//    return;
+			//}
+		}
+	});
+	Ok(Response::builder()
+		.header("Content-Type", "application/json")
+		.body(body)
+		.context("constructing response")?)
 }
 
 async fn route_depaginate_post(
 	headers: HeaderMap,
-    Path(canvas_path): Path<String>,
+	Path(canvas_path): Path<String>,
 	Query(params): Query<HashMap<String, String>>,
 	body: String,
 ) -> AnyResult<Json<serde_json::Value>> {
-    dbg!(&headers, &canvas_path, &params, &body);
+	dbg!(&headers, &canvas_path, &params, &body);
 	todo!()
 }
