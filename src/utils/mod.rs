@@ -36,6 +36,7 @@ impl Token {
 }
 
 // Make our own error that wraps `anyhow::Error`.
+#[derive(Debug)]
 pub struct AnyError(pub anyhow::Error);
 pub type AnyResult<T> = Result<T, AnyError>;
 

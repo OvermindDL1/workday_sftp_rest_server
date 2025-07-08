@@ -673,6 +673,78 @@ async fn route_depaginate_get(
 	Path(canvas_path): Path<String>,
 	Query(mut params): Query<HashMap<String, String>>,
 ) -> AnyResult<Response> {
+	use serde_json::Value;
+	//let authorization = headers
+	//    .get("authorization")
+	//    .context("missing authorization")?
+	//    .to_str()
+	//    .context("headers should be strings")?
+	//    .to_string();
+	if let Some(unroll) = params.remove("UNROLL") {
+		let Value::Object(unroll) = serde_json::from_str::<Value>(&unroll).expect("UNROLL param was not object json")
+		else {
+			panic!("UNROLL param was no object: {unroll}")
+		};
+		assert_eq!(unroll.len(), 1, "only 1 unroll value is currently supported");
+		dbg!(&unroll);
+		let (path_key, values) = unroll.into_iter().next().expect("1 unroll values must exist");
+		match values {
+			Value::Array(values) => {
+				let body = Body::from_stream(stream! {
+					yield Ok(Bytes::from_static(b"["));
+					let mut is_first = true;
+					for obj in values {
+						let Value::Object(obj) = obj else {
+							panic!("did not pass in an object in the array in unroll");
+						};
+						assert_eq!(obj.len(), 1, "object in array in unroll must have only one kv");
+						let (key, value) = obj.into_iter().next().expect("should have one value");
+						let value = match value {
+							Value::String(value) => value,
+							_ => panic!("unhandled value type in unroll request: {value:#?}"),
+						};
+						let canvas_path = canvas_path.replace(&format!("UNROLL:{path_key}:keyed"), &format!("{key}:{value}")).replace(&format!("UNROLL:{path_key}"), &value).to_string();
+						let headers = headers.clone();
+						let params = params.clone();
+						let response = Box::pin(depaginate_get(headers, Path(canvas_path), Query(params))).await.expect("processing route failed");
+						let bytes = axum::body::to_bytes(response.into_body(), 100_000_000).await.expect("processing body stream failed");
+						//match serde_json::from_slice(bytes.as_ref()) {
+						//    Serde::Array(values) => {
+						//        for
+						//    }
+						//    unhandled => panic!("unhandled resending type: {unhandled:#?}"),
+						//}
+						if !is_first {
+							yield Ok(Bytes::from_static(b","));
+						}
+						is_first = false;
+						if bytes.starts_with(b"[") && bytes.ends_with(b"]") {
+							let bytes = Bytes::copy_from_slice(&bytes[1..(bytes.len()-1)]);
+							yield Ok::<_, Box<(dyn std::error::Error + Send + Sync + 'static)>>(bytes);
+						} else {
+                            panic!("Unhandled resending type: {}", (*bytes.first().unwrap()) as char);
+                        }
+					}
+					yield Ok(Bytes::from_static(b"]"));
+				});
+				Ok(Response::builder()
+					.header("Content-Type", "application/json")
+					.body(body)
+					.context("constructing response")?)
+			}
+			_ => panic!("unsupported UNROLL type for: {values:#?}"),
+		}
+	} else {
+		depaginate_get(headers, Path(canvas_path), Query(params)).await
+	}
+}
+
+#[instrument(level = "info", skip(headers))]
+async fn depaginate_get(
+	headers: HeaderMap,
+	Path(canvas_path): Path<String>,
+	Query(mut params): Query<HashMap<String, String>>,
+) -> AnyResult<Response> {
 	let authorization = headers
 		.get("authorization")
 		.context("missing authorization")?
@@ -683,7 +755,7 @@ async fn route_depaginate_get(
 		let only_one_page = params.remove("only_one_page").is_some();
 		let client = reqwest::Client::new();
 		let mut canvas_url = Url::parse(&format!("https://cloviscc.instructure.com/{canvas_path}")).context("invalid canvas url")?;
-        canvas_url.query_pairs_mut().extend_pairs(&params);
+		canvas_url.query_pairs_mut().extend_pairs(&params);
 		let mut response_handle = Some(tokio::spawn(client.get(canvas_url.clone()).header("authorization", &authorization).send()));
 		yield Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Bytes::from_static(b"["));
 		loop {
